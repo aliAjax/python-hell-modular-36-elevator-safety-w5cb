@@ -2,7 +2,8 @@ import hashlib
 from uuid import uuid4
 
 from .audit import AuditTrail
-from .domain import ConflictError, NotFoundError, PermissionDenied, ValidationError
+from .domain import ConflictError, NotFoundError, ValidationError
+from .repository import utcnow
 from .rules import RuleEngine
 
 
@@ -15,48 +16,152 @@ class DomainService:
     def _lookup(self, kind, field, value):
         return self.repository.find_entities(self.rules.normalize_kind(kind), field, value)
 
+    def _tx_lookup(self, conn):
+        def lookup(kind, field, value):
+            return self.repository.find_entities(self.rules.normalize_kind(kind), field, value, conn)
+        return lookup
+
     def health(self):
         return {"status": "ok" if self.repository.ping() else "error"}
 
     def create(self, actor, kind, data, idempotency_key=None):
         kind = self.rules.normalize_kind(kind)
         payload = dict(data or {})
-        if idempotency_key:
-            existing = self.repository.get_idempotency(actor.user_id, idempotency_key)
-            if existing:
-                entity = self.repository.get_entity(existing)
-                if entity:
-                    return entity
-        self.rules.validate_create(actor, kind, payload, self._lookup)
-        entity_id = str(payload.pop("id", "") or uuid4())
-        if self.repository.get_entity(entity_id):
-            raise ConflictError("entity already exists: " + entity_id)
-        status = self.rules.initial_status(kind, payload)
-        entity = self.repository.create_entity(entity_id, kind, status, payload, actor.user_id)
-        self.audit.record(entity_id, actor, "create", None, status, {"kind": kind})
-        if idempotency_key:
-            self.repository.save_idempotency(actor.user_id, idempotency_key, entity_id)
-        return entity
+        with self.repository.transaction() as conn:
+            self.rules.validate_create(actor, kind, payload, self._tx_lookup(conn))
+            entity_id = str(payload.pop("id", "") or uuid4())
+            status = self.rules.initial_status(kind, payload)
+            if idempotency_key:
+                existing_id = self.repository.get_idempotency(actor.user_id, idempotency_key, conn)
+                if existing_id:
+                    existing = self.repository.get_entity(existing_id, conn)
+                    if existing:
+                        return existing
+            if self.repository.get_entity(entity_id, conn):
+                raise ConflictError("entity already exists: " + entity_id)
+            self.repository.create_entity(entity_id, kind, status, payload, actor.user_id, conn)
+            self.repository.append_audit(
+                entity_id, actor.user_id, actor.role, "create", None, status, {"kind": kind}, conn
+            )
+            if idempotency_key:
+                self.repository.save_idempotency(actor.user_id, idempotency_key, entity_id, conn)
+        return self.repository.get_entity(entity_id)
 
     def transition(self, actor, entity_id, action, data=None, expected_version=None):
-        entity = self.repository.get_entity(entity_id)
-        if not entity:
-            raise NotFoundError("entity not found: " + entity_id)
-        expected = int(expected_version) if expected_version is not None else entity["version"]
-        next_status, patch = self.rules.validate_transition(
-            actor, entity, action, dict(data or {}), self._lookup
+        with self.repository.transaction() as conn:
+            entity = self.repository.get_entity(entity_id, conn)
+            if not entity:
+                raise NotFoundError("entity not found: " + entity_id)
+            expected = int(expected_version) if expected_version is not None else entity["version"]
+            if expected is not None and entity["version"] != expected:
+                raise ConflictError(
+                    "version conflict: expected %s, found %s" % (expected, entity["version"])
+                )
+            next_status, patch = self.rules.validate_transition(
+                actor, entity, action, dict(data or {}), self._tx_lookup(conn)
+            )
+            merged = dict(entity["data"])
+            merged.update(patch)
+
+            if self._is_component_replacement_completion(entity, action, merged):
+                return self._complete_component_replacement(actor, entity, next_status, merged, conn)
+
+            updated = self.repository.update_entity(
+                entity_id, entity["version"], next_status, merged, conn
+            )
+            self.repository.append_audit(
+                entity_id,
+                actor.user_id,
+                actor.role,
+                action,
+                entity["status"],
+                updated["status"],
+                {"patch": patch},
+                conn,
+            )
+        return updated
+
+    @staticmethod
+    def _is_component_replacement_completion(entity, action, merged):
+        return (
+            entity["kind"] == "maintenance"
+            and action == "complete"
+            and merged.get("work_type") == "component_replacement"
         )
-        merged = dict(entity["data"])
-        merged.update(patch)
-        updated = self.repository.update_entity(entity_id, expected, next_status, merged)
-        self.audit.record(
-            entity_id,
-            actor,
-            action,
+
+    def _complete_component_replacement(self, actor, entity, next_status, merged, conn):
+        """Complete a key component replacement as one atomic unit.
+
+        Runs inside the caller's transaction (already under the write lock):
+        the maintenance update, the voiding of the equipment's old passed
+        inspections, the withdrawal of its pending/granted permits, and every
+        audit entry commit together. If any write fails the transaction rolls
+        back, so the equipment and its certificates never observe a
+        half-new half-old state and the original records are preserved.
+        """
+        equipment_id = entity["data"].get("equipment_id")
+        updated = self.repository.update_entity(
+            entity["id"], entity["version"], next_status, merged, conn
+        )
+        self.repository.append_audit(
+            entity["id"],
+            actor.user_id,
+            actor.role,
+            "complete",
             entity["status"],
             updated["status"],
-            {"patch": patch},
+            {"patch": merged},
+            conn,
         )
+
+        inspections = self.repository.list_entities(kind="inspection", conn=conn)
+        permits = self.repository.list_entities(kind="permit", conn=conn)
+        void_inspections, revoke_permits = self.rules.component_replacement_effects(
+            equipment_id, inspections, permits
+        )
+
+        for inspection in void_inspections:
+            inspection_data = dict(inspection["data"])
+            inspection_data["voided_by"] = actor.user_id
+            inspection_data["voided_at"] = utcnow()
+            self.repository.update_entity(
+                inspection["id"], inspection["version"], "void", inspection_data, conn
+            )
+            self.repository.append_audit(
+                inspection["id"],
+                actor.user_id,
+                actor.role,
+                "void",
+                inspection["status"],
+                "void",
+                {
+                    "reason": "component_replacement_completed",
+                    "maintenance_id": entity["id"],
+                },
+                conn,
+            )
+
+        for permit in revoke_permits:
+            permit_data = dict(permit["data"])
+            permit_data["revoked_by"] = actor.user_id
+            permit_data["revoked_at"] = utcnow()
+            permit_data["revoke_reason"] = "component_replacement_completed"
+            self.repository.update_entity(
+                permit["id"], permit["version"], "revoked", permit_data, conn
+            )
+            self.repository.append_audit(
+                permit["id"],
+                actor.user_id,
+                actor.role,
+                "revoke",
+                permit["status"],
+                "revoked",
+                {
+                    "reason": "component_replacement_completed",
+                    "maintenance_id": entity["id"],
+                },
+                conn,
+            )
         return updated
 
     def merge_offline(self, actor, records):
@@ -73,21 +178,32 @@ class DomainService:
                 raise ValidationError("source_id and record_id are required")
             digest = hashlib.sha256((source_id + "\0" + record_id).encode("utf-8")).hexdigest()[:32]
             entity_id = "offline-" + digest
-            existing = self.repository.get_entity(entity_id)
-            if existing:
-                created.append(existing)
-                continue
-            payload = dict(raw)
-            self.rules.validate_create(actor, "offline_record", payload, self._lookup)
-            entity = self.repository.create_entity(
-                entity_id,
-                "offline_record",
-                self.rules.initial_status("offline_record", payload),
-                payload,
-                actor.user_id,
-            )
-            self.audit.record(entity_id, actor, "merge_offline", None, entity["status"], {"source_id": source_id, "record_id": record_id})
-            created.append(entity)
+            with self.repository.transaction() as conn:
+                existing = self.repository.get_entity(entity_id, conn)
+                if existing:
+                    created.append(existing)
+                    continue
+                payload = dict(raw)
+                self.rules.validate_create(actor, "offline_record", payload, self._tx_lookup(conn))
+                status = self.rules.initial_status("offline_record", payload)
+                self.repository.create_entity(
+                    entity_id,
+                    "offline_record",
+                    status,
+                    payload,
+                    actor.user_id,
+                    conn,
+                )
+                self.repository.append_audit(
+                    entity_id,
+                    actor.user_id,
+                    actor.role,
+                    "merge_offline",
+                    None,
+                    status,
+                    {"source_id": source_id, "record_id": record_id},
+                    conn,
+                )
         return created
 
     def get(self, entity_id):

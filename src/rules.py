@@ -126,6 +126,29 @@ def _complete_rescue(actor, entity, data, lookup):
     return {"resolved_by": actor.user_id}
 
 
+def _component_replacement_effects(equipment_id, inspections, permits):
+    """Side effects of completing a key component replacement.
+
+    Replacing a component changes the equipment's safety basis, so:
+    - previously passed inspections for the equipment are immediately void
+      (they no longer prove the equipment is fit for service);
+    - pending_review and granted return-to-service permits are withdrawn;
+    - open (non-closed) remediations are left untouched and keep blocking
+      the next permit grant.
+    Returns (void_inspections, revoke_permits).
+    """
+    void_inspections = [
+        i for i in inspections
+        if i["data"].get("equipment_id") == equipment_id and i["status"] == "passed"
+    ]
+    revoke_permits = [
+        p for p in permits
+        if p["data"].get("equipment_id") == equipment_id
+        and p["status"] in ("pending_review", "granted")
+    ]
+    return void_inspections, revoke_permits
+
+
 class RuleEngine:
     ALIASES = {
         "equipments": "equipment", "inspections": "inspection", "maintenances": "maintenance",
@@ -278,3 +301,6 @@ class RuleEngine:
         if extra:
             patch.update(extra)
         return next_status, patch
+
+    def component_replacement_effects(self, equipment_id, inspections, permits):
+        return _component_replacement_effects(equipment_id, inspections, permits)
