@@ -119,6 +119,49 @@ def _verify_remediation(actor, entity, data, lookup):
     return {"verified_by": actor.user_id}
 
 
+def _component_replacement_effects(actor, entity, data, lookup):
+    equipment_id = entity["data"].get("equipment_id")
+    completed_at = data.get("completed_at") or datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+    effects = []
+    for inspection in _all(lookup, "inspection"):
+        if inspection["data"].get("equipment_id") != equipment_id:
+            continue
+        if inspection["status"] in ("scheduled", "passed", "failed"):
+            effects.append({
+                "entity_id": inspection["id"],
+                "action": "invalidate",
+                "expected_statuses": ["scheduled", "passed", "failed"],
+                "status": "invalidated",
+                "patch": {
+                    "invalidated_at": completed_at,
+                    "invalidated_by": actor.user_id,
+                    "reason": "component replacement completed",
+                    "caused_by_maintenance_id": entity["id"],
+                },
+            })
+
+    for permit in _all(lookup, "permit"):
+        if permit["data"].get("equipment_id") != equipment_id:
+            continue
+        if permit["data"].get("purpose") != "return_to_service":
+            continue
+        if permit["status"] in ("pending_review", "granted"):
+            effects.append({
+                "entity_id": permit["id"],
+                "action": "revoke",
+                "expected_statuses": ["pending_review", "granted"],
+                "status": "revoked",
+                "patch": {
+                    "revoked_at": completed_at,
+                    "revoked_by": actor.user_id,
+                    "reason": "component replacement completed; prior inspection and clearance are no longer valid",
+                    "caused_by_maintenance_id": entity["id"],
+                },
+            })
+    return effects
+
+
 def _complete_rescue(actor, entity, data, lookup):
     jobs = [j for j in _all(lookup, "rescue_job") if j["data"].get("alarm_id") == entity["id"]]
     if not jobs or any(job["status"] not in ("completed", "aborted") for job in jobs):
@@ -146,6 +189,7 @@ class RuleEngine:
         "inspection": {
             "pass": (("scheduled",), "passed"),
             "fail": (("scheduled",), "failed"),
+            "invalidate": (("scheduled", "passed", "failed"), "invalidated"),
             "reschedule": (("failed",), "scheduled"),
         },
         "maintenance": {
@@ -188,6 +232,7 @@ class RuleEngine:
     ACTION_REQUIRED = {
         ("inspection", "pass"): ("findings",),
         ("inspection", "fail"): ("findings",),
+        ("inspection", "invalidate"): ("reason",),
         ("maintenance", "complete"): ("completed_at",),
         ("rescue_job", "complete"): ("outcome",),
         ("remediation", "submit_evidence"): ("evidence",),
@@ -209,6 +254,7 @@ class RuleEngine:
         "return_to_service": ("admin", "inspector"),
         "pass": ("admin", "inspector"),
         "fail": ("admin", "inspector"),
+        "invalidate": ("admin", "inspector"),
         "reschedule": ("admin", "inspector"),
         "start": ("admin", "maintenance"),
         "complete": ("admin", "maintenance", "dispatcher"),
@@ -244,6 +290,18 @@ class RuleEngine:
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
 
+    def aggregate_lock_id(self, entity, action):
+        kind = self.normalize_kind(entity["kind"])
+        if kind == "inspection" and action == "pass":
+            return entity["data"].get("equipment_id")
+        if (
+            kind == "maintenance"
+            and action == "complete"
+            and entity["data"].get("work_type") == "component_replacement"
+        ):
+            return entity["data"].get("equipment_id")
+        return None
+
     def initial_status(self, kind, data=None):
         kind = self.normalize_kind(kind)
         if kind not in self.INITIAL_STATUS:
@@ -262,6 +320,10 @@ class RuleEngine:
         return dict(data)
 
     def validate_transition(self, actor, entity, action, data, lookup=None):
+        next_status, patch, _effects = self.plan_transition(actor, entity, action, data, lookup)
+        return next_status, patch
+
+    def plan_transition(self, actor, entity, action, data, lookup=None):
         kind = self.normalize_kind(entity["kind"])
         transition = self.TRANSITIONS.get(kind, {}).get(action)
         if not transition:
@@ -277,4 +339,9 @@ class RuleEngine:
         patch = dict(data)
         if extra:
             patch.update(extra)
-        return next_status, patch
+        merged = dict(entity["data"])
+        merged.update(patch)
+        effects = []
+        if kind == "maintenance" and action == "complete" and entity["data"].get("work_type") == "component_replacement":
+            effects = _component_replacement_effects(actor, entity, patch, lookup)
+        return next_status, patch, effects

@@ -2,7 +2,7 @@ import hashlib
 from uuid import uuid4
 
 from .audit import AuditTrail
-from .domain import ConflictError, NotFoundError, PermissionDenied, ValidationError
+from .domain import ConflictError, InvalidTransition, NotFoundError, PermissionDenied, ValidationError
 from .rules import RuleEngine
 
 
@@ -12,8 +12,10 @@ class DomainService:
         self.rules = rules or RuleEngine()
         self.audit = AuditTrail(repository)
 
-    def _lookup(self, kind, field, value):
-        return self.repository.find_entities(self.rules.normalize_kind(kind), field, value)
+    def _lookup(self, kind, field, value, connection=None):
+        return self.repository.find_entities(
+            self.rules.normalize_kind(kind), field, value, connection=connection
+        )
 
     def health(self):
         return {"status": "ok" if self.repository.ping() else "error"}
@@ -43,20 +45,101 @@ class DomainService:
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
         expected = int(expected_version) if expected_version is not None else entity["version"]
-        next_status, patch = self.rules.validate_transition(
-            actor, entity, action, dict(data or {}), self._lookup
+        payload = dict(data or {})
+        next_status, patch, effects = self.rules.plan_transition(
+            actor, entity, action, payload, self._lookup
         )
-        merged = dict(entity["data"])
-        merged.update(patch)
-        updated = self.repository.update_entity(entity_id, expected, next_status, merged)
-        self.audit.record(
-            entity_id,
-            actor,
-            action,
-            entity["status"],
-            updated["status"],
-            {"patch": patch},
-        )
+        aggregate_id = self.rules.aggregate_lock_id(entity, action)
+        aggregate = self.repository.get_entity(aggregate_id) if aggregate_id else None
+        if aggregate_id and not aggregate:
+            raise NotFoundError("aggregate equipment not found: " + aggregate_id)
+        aggregate_version = aggregate["version"] if aggregate else None
+
+        with self.repository.transaction() as connection:
+            locked_entity = self.repository.get_entity(entity_id, connection=connection)
+            if not locked_entity:
+                raise NotFoundError("entity not found: " + entity_id)
+            locked_aggregate = (
+                self.repository.get_entity(aggregate_id, connection=connection)
+                if aggregate_id
+                else None
+            )
+            if aggregate_id and not locked_aggregate:
+                raise NotFoundError("aggregate equipment not found: " + aggregate_id)
+            if locked_aggregate and locked_aggregate["version"] != aggregate_version:
+                raise ConflictError("version conflict on equipment; refetch the latest data")
+
+            next_status, patch, effects = self.rules.plan_transition(
+                actor,
+                locked_entity,
+                action,
+                payload,
+                lambda kind, field, value: self._lookup(kind, field, value, connection=connection),
+            )
+            merged = dict(locked_entity["data"])
+            merged.update(patch)
+            updated = self.repository.update_entity(
+                entity_id, expected, next_status, merged, connection=connection
+            )
+            self.repository.append_audit(
+                connection=connection,
+                entity_id=entity_id,
+                actor_id=actor.user_id,
+                actor_role=actor.role,
+                action=action,
+                from_status=locked_entity["status"],
+                to_status=updated["status"],
+                detail={"patch": patch, "effects": len(effects)},
+            )
+
+            if locked_aggregate:
+                self.repository.update_entity(
+                    aggregate_id,
+                    aggregate_version,
+                    locked_aggregate["status"],
+                    dict(locked_aggregate["data"]),
+                    connection=connection,
+                )
+                self.repository.append_audit(
+                    connection=connection,
+                    entity_id=aggregate_id,
+                    actor_id=actor.user_id,
+                    actor_role=actor.role,
+                    action="safety_epoch",
+                    from_status=locked_aggregate["status"],
+                    to_status=locked_aggregate["status"],
+                    detail={"caused_by": entity_id, "action": action},
+                )
+
+            for effect in effects:
+                target = self.repository.get_entity(effect["entity_id"], connection=connection)
+                if not target:
+                    raise NotFoundError("effect target not found: " + effect["entity_id"])
+                if target["status"] not in effect["expected_statuses"]:
+                    raise InvalidTransition(
+                        "cannot %s %s from status %s"
+                        % (effect["action"], effect["entity_id"], target["status"])
+                    )
+                effect_data = dict(target["data"])
+                effect_data.update(effect["patch"])
+                effect_updated = self.repository.update_entity(
+                    effect["entity_id"],
+                    target["version"],
+                    effect["status"],
+                    effect_data,
+                    connection=connection,
+                )
+                self.repository.append_audit(
+                    connection=connection,
+                    entity_id=effect["entity_id"],
+                    actor_id=actor.user_id,
+                    actor_role=actor.role,
+                    action=effect["action"],
+                    from_status=target["status"],
+                    to_status=effect_updated["status"],
+                    detail={"patch": effect["patch"], "caused_by": entity_id},
+                )
+
         return updated
 
     def merge_offline(self, actor, records):
